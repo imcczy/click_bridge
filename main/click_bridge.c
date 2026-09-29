@@ -12,6 +12,8 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
+#include "hid_keyboard.h"
+
 static const char *TAG = "click_bridge";
 static const char CLICK_NAME[] = "Zwift Click";
 static const uint8_t RIDE_ON[] = {'R', 'i', 'd', 'e', 'O', 'n'};
@@ -186,11 +188,17 @@ static void parse_click_notification(const uint8_t *data, size_t length)
         }
     }
 
+    bool changed = false;
     if (plus_value >= 0) {
-        update_button_state("PLUS", &plus_pressed, plus_value == 0);
+        changed |= update_button_state("PLUS", &plus_pressed,
+                                       plus_value == 0);
     }
     if (minus_value >= 0) {
-        update_button_state("MINUS", &minus_pressed, minus_value == 0);
+        changed |= update_button_state("MINUS", &minus_pressed,
+                                       minus_value == 0);
+    }
+    if (changed) {
+        hid_keyboard_send_state(plus_pressed == 1, minus_pressed == 1);
     }
 }
 
@@ -202,6 +210,8 @@ static void handle_click_notification(struct ble_gap_event *event)
         os_mbuf_copydata(event->notify_rx.om, 0, length, data) == 0) {
         if (event->notify_rx.attr_handle == async_val_handle) {
             parse_click_notification(data, length);
+            /* Fallback for Click firmware that does not update parameters. */
+            hid_keyboard_start_advertising();
         }
     }
 }
@@ -407,6 +417,7 @@ static void connect_to_click(const ble_addr_t *addr)
         click_scan();
         return;
     }
+
     rc = ble_gap_connect(own_addr_type, addr, 30000, NULL,
                          click_gap_event, NULL);
     if (rc != 0) {
@@ -455,6 +466,13 @@ static int click_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_NOTIFY_RX:
         handle_click_notification(event);
         return 0;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        if (event->conn_update.conn_handle == click_conn_handle &&
+            event->conn_update.status == 0) {
+            ESP_LOGI(TAG, "Click link stable; enabling HID advertising");
+            hid_keyboard_start_advertising();
+        }
+        return 0;
     case BLE_GAP_EVENT_DISC_COMPLETE:
         if (!connecting_to_click &&
             click_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
@@ -500,6 +518,7 @@ static void host_reset(int reason)
     ESP_LOGE(TAG, "NimBLE reset; reason=%d", reason);
     connecting_to_click = false;
     reset_click_state();
+    hid_keyboard_reset();
 }
 
 static void host_sync(void)
@@ -531,6 +550,7 @@ void app_main(void)
 
     reset_click_state();
     ESP_ERROR_CHECK(nimble_port_init());
+    ESP_ERROR_CHECK(hid_keyboard_init());
     ble_hs_cfg.reset_cb = host_reset;
     ble_hs_cfg.sync_cb = host_sync;
     nimble_port_freertos_init(host_task);
