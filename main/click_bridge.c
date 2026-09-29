@@ -368,7 +368,7 @@ static int ClickGapEvent(struct ble_gap_event* event, void* arg) {
       if (event->disconnect.conn.conn_handle != click_conn_handle) {
         return 0;
       }
-      ESP_LOGW(kTag, "Click disconnected; reason=%d", event->disconnect.reason);
+      ESP_LOGI(kTag, "Click disconnected; reason=%d", event->disconnect.reason);
       // A lost release notification must not leave an iPad key held down.
       HidKeyboardSendState(false, false);
       ResetClickState();

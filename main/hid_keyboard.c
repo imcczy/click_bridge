@@ -26,6 +26,9 @@ enum {
   kHidUsageK = 0x0e,
   kReportLength = 7,
   kBootReportLength = 8,
+  kInitialRetryMs = 200,
+  kMaxRetryMs = 5000,
+  kWarningIntervalMs = 30000,
 };
 
 _Static_assert(CONFIG_BT_NIMBLE_SM_LVL == 2,
@@ -78,10 +81,39 @@ static uint8_t protocol_mode = BLE_SVC_HID_PROTO_MODE_REPORT;
 static bool suspended;
 static uint8_t keyboard_report[kBootReportLength];
 static struct ble_npl_callout advertising_retry;
+static bool advertising_retry_pending;
+static uint32_t advertising_retry_ms = kInitialRetryMs;
+
+struct WarningLimiter {
+  ble_npl_time_t last_tick;
+  bool logged;
+};
+
+static struct WarningLimiter advertising_warning;
+static struct WarningLimiter report_warning;
 
 static int HidGapEvent(struct ble_gap_event* event, void* arg);
 static void HidAdvertise(void);
 static void SendReport(void);
+
+// Limit each failure path independently, without adding a periodic timer.
+static void LogWarning(struct WarningLimiter* limiter, const char* message,
+                       int status) {
+  ble_npl_time_t now = ble_npl_time_get();
+  if (!limiter->logged || (ble_npl_time_t)(now - limiter->last_tick) >=
+                              ble_npl_time_ms_to_ticks32(kWarningIntervalMs)) {
+    ESP_LOGW(kTag, "%s; status=%d", message, status);
+    limiter->last_tick = now;
+    limiter->logged = true;
+  }
+}
+
+static void ResetAdvertisingRetry(void) {
+  ble_npl_callout_stop(&advertising_retry);
+  advertising_retry_pending = false;
+  advertising_retry_ms = kInitialRetryMs;
+  advertising_warning = (struct WarningLimiter){0};
+}
 
 static void CharacteristicWriteCallback(uint16_t attr_handle, uint16_t uuid,
                                         uint8_t value) {
@@ -96,18 +128,25 @@ static void CharacteristicWriteCallback(uint16_t attr_handle, uint16_t uuid,
 
 static void AdvertisingRetryCallback(struct ble_npl_event* event) {
   (void)event;
+  advertising_retry_pending = false;
   HidAdvertise();
 }
 
 static void ScheduleAdvertising(void) {
-  if (!advertising_enabled || hid_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+  if (!advertising_enabled || hid_conn_handle != BLE_HS_CONN_HANDLE_NONE ||
+      advertising_retry_pending) {
     return;
   }
-  int rc = ble_npl_callout_reset(&advertising_retry,
-                                 ble_npl_time_ms_to_ticks32(200));
+  int rc = ble_npl_callout_reset(
+      &advertising_retry, ble_npl_time_ms_to_ticks32(advertising_retry_ms));
   if (rc != 0) {
-    ESP_LOGE(kTag, "Could not schedule HID advertising; rc=%d", rc);
+    LogWarning(&advertising_warning, "Could not schedule HID advertising", rc);
+    return;
   }
+  advertising_retry_pending = true;
+  advertising_retry_ms = advertising_retry_ms < kMaxRetryMs / 2
+                             ? advertising_retry_ms * 2
+                             : kMaxRetryMs;
 }
 
 static void RegisterGattCallback(struct ble_gatt_register_ctxt* ctxt,
@@ -130,14 +169,16 @@ static void RegisterGattCallback(struct ble_gatt_register_ctxt* ctxt,
 
 static void HidAdvertise(void) {
   if (!advertising_enabled || hid_conn_handle != BLE_HS_CONN_HANDLE_NONE ||
-      ble_gap_adv_active()) {
+      advertising_retry_pending || ble_gap_adv_active()) {
     return;
   }
 
   uint8_t own_addr_type;
   int rc = ble_hs_id_infer_auto(0, &own_addr_type);
   if (rc != 0) {
-    ESP_LOGE(kTag, "Could not determine advertising address; rc=%d", rc);
+    LogWarning(&advertising_warning, "Could not determine advertising address",
+               rc);
+    ScheduleAdvertising();
     return;
   }
 
@@ -155,7 +196,8 @@ static void HidAdvertise(void) {
   };
   rc = ble_gap_adv_set_fields(&fields);
   if (rc != 0) {
-    ESP_LOGE(kTag, "Could not set HID advertising data; rc=%d", rc);
+    LogWarning(&advertising_warning, "Could not set HID advertising data", rc);
+    ScheduleAdvertising();
     return;
   }
 
@@ -168,7 +210,7 @@ static void HidAdvertise(void) {
   rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &params,
                          HidGapEvent, NULL);
   if (rc != 0) {
-    ESP_LOGE(kTag, "Could not start HID advertising; rc=%d", rc);
+    LogWarning(&advertising_warning, "Could not start HID advertising", rc);
     ScheduleAdvertising();
   } else {
     ESP_LOGI(kTag, "HID advertising started as %s", kDeviceName);
@@ -183,8 +225,8 @@ static int HidGapEvent(struct ble_gap_event* event, void* arg) {
   switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
       if (event->connect.status != 0) {
-        ESP_LOGW(kTag, "iPad HID connection failed; status=%d",
-                 event->connect.status);
+        LogWarning(&advertising_warning, "iPad HID connection failed",
+                   event->connect.status);
         ScheduleAdvertising();
         return 0;
       }
@@ -194,7 +236,8 @@ static int HidGapEvent(struct ble_gap_event* event, void* arg) {
         return 0;
       }
       hid_conn_handle = event->connect.conn_handle;
-      ble_npl_callout_stop(&advertising_retry);
+      ResetAdvertisingRetry();
+      report_warning = (struct WarningLimiter){0};
       report_input_subscribed = false;
       boot_input_subscribed = false;
       protocol_mode = BLE_SVC_HID_PROTO_MODE_REPORT;
@@ -211,7 +254,7 @@ static int HidGapEvent(struct ble_gap_event* event, void* arg) {
           event->disconnect.conn.role != BLE_GAP_ROLE_SLAVE) {
         return 0;
       }
-      ESP_LOGW(kTag, "iPad HID disconnected; reason=%d",
+      ESP_LOGI(kTag, "iPad HID disconnected; reason=%d",
                event->disconnect.reason);
       hid_conn_handle = BLE_HS_CONN_HANDLE_NONE;
       report_input_subscribed = false;
@@ -238,11 +281,12 @@ static int HidGapEvent(struct ble_gap_event* event, void* arg) {
 
     case BLE_GAP_EVENT_ENC_CHANGE:
       if (event->enc_change.conn_handle == hid_conn_handle) {
-        ESP_LOGI(kTag, "HID security %s; status=%d",
-                 event->enc_change.status == 0 ? "ready" : "failed",
-                 event->enc_change.status);
         if (event->enc_change.status == 0) {
+          ESP_LOGI(kTag, "HID security ready");
           SendReport();
+        } else {
+          ESP_LOGW(kTag, "HID security failed; status=%d",
+                   event->enc_change.status);
         }
       }
       return 0;
@@ -250,8 +294,8 @@ static int HidGapEvent(struct ble_gap_event* event, void* arg) {
     case BLE_GAP_EVENT_NOTIFY_TX:
       if (event->notify_tx.conn_handle == hid_conn_handle &&
           event->notify_tx.status != 0) {
-        ESP_LOGW(kTag, "HID notification failed; handle=%u status=%d",
-                 event->notify_tx.attr_handle, event->notify_tx.status);
+        LogWarning(&report_warning, "HID notification failed",
+                   event->notify_tx.status);
       }
       return 0;
 
@@ -341,7 +385,8 @@ int HidKeyboardInit(void) {
 }
 
 void HidKeyboardReset(void) {
-  ble_npl_callout_stop(&advertising_retry);
+  ResetAdvertisingRetry();
+  report_warning = (struct WarningLimiter){0};
   hid_conn_handle = BLE_HS_CONN_HANDLE_NONE;
   report_input_subscribed = false;
   boot_input_subscribed = false;
@@ -379,12 +424,12 @@ static void SendReport(void) {
   size_t report_len = report_mode ? kReportLength : kBootReportLength;
   struct os_mbuf* om = ble_hs_mbuf_from_flat(keyboard_report, report_len);
   if (om == NULL) {
-    ESP_LOGE(kTag, "Could not allocate HID report");
+    LogWarning(&report_warning, "Could not allocate HID report", BLE_HS_ENOMEM);
     return;
   }
   int rc = ble_gatts_notify_custom(hid_conn_handle, handle, om);
   if (rc != 0) {
-    ESP_LOGW(kTag, "Could not send HID report; rc=%d", rc);
+    LogWarning(&report_warning, "Could not send HID report", rc);
   }
 }
 
